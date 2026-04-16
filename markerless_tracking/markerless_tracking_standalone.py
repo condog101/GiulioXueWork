@@ -7,21 +7,19 @@ Usage:
     python markerless_tracking_standalone.py
 """
 
-# Disable TF v2 behavior FIRST, before any other imports that might use TensorFlow
-import utils.model as model
 import pyrealsense2 as rs
 import cv2
 import numpy as np
 import sys
 import os
 import time
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
-
+import torch
 
 # Use relative imports for standalone operation
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(script_dir))
+
+from utils.model_pytorch import AlexNet2, PointNetSeg, nms
 
 
 # Helper function for safe OpenCV display (may not have GUI support)
@@ -47,45 +45,34 @@ class MarkerlessTracker:
         self.NUM_POINT = 2000
 
         # Hardcoded checkpoint paths
-        self.rgb_ckpt_path = '/home/connorscomputer/Desktop/MarkerlessTrackingNode-master/markerless_tracking/ckpt/rgb/'
-        self.pcl_ckpt_path = '/home/connorscomputer/Desktop/MarkerlessTrackingNode-master/markerless_tracking/ckpt/pcl/'
+        self.rgb_ckpt_path = os.path.join(script_dir, 'ckpt', 'rgb', 'alexnet2.pt')
+        self.pcl_ckpt_path = os.path.join(script_dir, 'ckpt', 'pcl', 'pointnet_seg.pt')
 
-        # Build TensorFlow graph
-        print("Building TensorFlow graph on GPU...")
-        with tf.device('/gpu:0'):
-            # RGB network for ROI detection
-            self.RGB = tf.placeholder(
-                tf.float32, [None, 512, 512, 3], name='x')
-            self.probs, self.preds_loc = model.AlexNet2(
-                self.RGB, scope='newroi')
+        # Select device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
 
-            # Point cloud segmentation network
-            self.PCL = tf.placeholder(tf.float32, shape=(1, self.NUM_POINT, 3))
-            self.prediction = model.get_model(self.PCL, scope='newseg')
+        # Build and load RGB network (AlexNet2 SSD detector)
+        print("Loading RGB model...")
+        self.rgb_model = AlexNet2()
+        self.rgb_model.load_state_dict(
+            torch.load(self.rgb_ckpt_path, map_location=self.device, weights_only=True))
+        self.rgb_model.to(self.device)
+        # Original TF code uses is_training=True for BN even at inference
+        self.rgb_model.train()
 
-        # Create TensorFlow session
-        config = tf.ConfigProto()
-        config.gpu_options.allow_growth = True
-        config.allow_soft_placement = True
-        config.log_device_placement = True
-        self.sess = tf.Session(config=config)
-
-        # Restore RGB model weights
-        variables_to_restore = tf.get_collection(
-            tf.GraphKeys.GLOBAL_VARIABLES, scope='newroi')
-        restorer = tf.train.Saver(variables_to_restore)
-        restorer.restore(
-            self.sess, tf.train.latest_checkpoint(self.rgb_ckpt_path))
-
-        # Restore PCL model weights
-        variables_to_restore = tf.get_collection(
-            tf.GraphKeys.GLOBAL_VARIABLES, scope='newseg')
-        restorer = tf.train.Saver(variables_to_restore)
-        restorer.restore(
-            self.sess, tf.train.latest_checkpoint(self.pcl_ckpt_path))
+        # Build and load PCL network (PointNet segmenter)
+        print("Loading PCL model...")
+        self.pcl_model = PointNetSeg(num_point=self.NUM_POINT)
+        self.pcl_model.load_state_dict(
+            torch.load(self.pcl_ckpt_path, map_location=self.device, weights_only=True))
+        self.pcl_model.to(self.device)
+        # Original TF code uses is_training=False (uses running BN stats)
+        self.pcl_model.eval()
 
         print("Finished init")
 
+    @torch.no_grad()
     def process_frame(self, rgb_raw, depth_raw):
         """
         Process a single frame from RealSense camera.
@@ -115,11 +102,13 @@ class MarkerlessTracker:
         depth[depth[:, :, 2] > 0.8] = np.array([0, 0, 0])
 
         # Run RGB network for bounding box detection
-        rgb_img = rgb.reshape([1, 512, 512, 3])
-        preds_loc_val, probs_val = self.sess.run(
-            [self.preds_loc, self.probs],
-            feed_dict={self.RGB: rgb_img}
-        )
+        rgb_tensor = torch.from_numpy(
+            rgb.reshape(1, 512, 512, 3).astype(np.float32)
+        ).permute(0, 3, 1, 2).to(self.device)  # NHWC -> NCHW
+
+        probs_t, preds_loc_t = self.rgb_model(rgb_tensor)
+        probs_val = probs_t.cpu().numpy()
+        preds_loc_val = preds_loc_t.cpu().numpy()
 
         preds_conf_val = (probs_val > 0.8).astype(int)
         y_pred_conf = preds_conf_val[0].astype('float32')
@@ -127,7 +116,7 @@ class MarkerlessTracker:
         prob = probs_val[0]
 
         # Perform NMS to get bounding box
-        box = model.nms(y_pred_conf, y_pred_loc, prob, extend=1.5)
+        box = nms(y_pred_conf, y_pred_loc, prob, extend=1.5)
 
         try:
             box_coords = [int(round(x)) for x in box[:4]]
@@ -172,9 +161,12 @@ class MarkerlessTracker:
 
         # Run segmentation network
         thresh = 0.5
-        pred_val = self.sess.run([self.prediction], feed_dict={
-                                 self.PCL: cropped_linear})
-        index2 = np.where(pred_val[0].squeeze() > thresh)[0]
+        pcl_tensor = torch.from_numpy(
+            cropped_linear.astype(np.float32)
+        ).to(self.device)
+
+        pred_val = self.pcl_model(pcl_tensor).cpu().numpy()  # [1, N]
+        index2 = np.where(pred_val[0] > thresh)[0]
 
         if len(index2) > 10:
             index = [index1[i] for i in index2]
@@ -187,7 +179,7 @@ class MarkerlessTracker:
                 rgb[row, col] = np.array([0, 0, 255])
 
         # Extract segmented points
-        femur = cropped_linear.squeeze()[pred_val[0].squeeze() > thresh]
+        femur = cropped_linear.squeeze()[pred_val[0] > thresh]
 
         bgr = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2BGR)
         safe_imshow('Segmentation', bgr)
@@ -203,7 +195,6 @@ class MarkerlessTracker:
 
     def close(self):
         """Clean up resources."""
-        self.sess.close()
         try:
             cv2.destroyAllWindows()
         except cv2.error:
