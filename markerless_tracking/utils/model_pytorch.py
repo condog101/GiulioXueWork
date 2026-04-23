@@ -201,9 +201,8 @@ class TransformNet(nn.Module):
         x = F.relu(self.bn4(self.fc1(x)))
         x = F.relu(self.bn5(self.fc2(x)))
         x = self.fc3(x)  # [B, K*K]
-        # Add identity
-        identity = torch.eye(self.K, device=x.device, dtype=x.dtype).flatten().unsqueeze(0)
-        x = x + identity
+        # The identity is already baked into fc3.bias from the checkpoint
+        # (TF adds identity to bias at graph-build time, so saved weights include it)
         return x.view(B, self.K, self.K)
 
 
